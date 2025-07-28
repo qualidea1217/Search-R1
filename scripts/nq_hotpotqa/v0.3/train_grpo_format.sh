@@ -1,12 +1,18 @@
 data_name=nq_hotpotqa_train
 
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-export DATA_DIR=data/${data_name} # first download the data from https://huggingface.co/datasets/PeterJinGo/nq_hotpotqa_train
+export RAY_LOG_DIR='/home/pxw240002/Search-R1/tmp/'
+export TMPDIR='/home/pxw240002/Search-R1/tmp/'
+export TEMP='/home/pxw240002/Search-R1/tmp/'
+export TMP='/home/pxw240002/Search-R1/tmp/'
 
-WAND_PROJECT="Search-R1"
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+export CUDA_VISIBLE_DEVICES=0,3,4,5
+export DATA_DIR=/home/pxw240002/Search-R1/data/${data_name} # first download the data from https://huggingface.co/datasets/PeterJinGo/nq_hotpotqa_train
 
-export BASE_MODEL='Qwen/Qwen2.5-3B'
-export EXPERIMENT_NAME=${data_name}-search-r1-grpo-qwen2.5-3b-em-structureformat
+WAND_PROJECT="Search-R1_step"
+
+export BASE_MODEL='/home/pxw240002/models/Qwen/Qwen2.5-3B-Instruct'
+export EXPERIMENT_NAME=${data_name}-search-r1-grpo-qwen2.5-3b-it-em-structureformat-step
 # export BASE_MODEL='Qwen/Qwen2.5-3B-Instruct'
 # export EXPERIMENT_NAME=${data_name}-search-r1-grpo-qwen2.5-3b-it-em-structureformat
 # export BASE_MODEL='Qwen/Qwen2.5-7B'
@@ -35,7 +41,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo_format \
     data.val_data_num=null \
     data.train_batch_size=512 \
     data.val_batch_size=256 \
-    data.max_prompt_length=4096 \
+    data.max_prompt_length=8192 \
     data.max_response_length=500 \
     data.max_start_length=2048 \
     data.max_obs_length=500 \
@@ -66,22 +72,22 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo_format \
     actor_rollout_ref.actor.state_masking=true \
     trainer.logger=['wandb'] \
     +trainer.val_only=false \
-    +trainer.val_before_train=true \
+    +trainer.val_before_train=false \
     trainer.default_hdfs_dir=null \
-    trainer.n_gpus_per_node=8 \
+    trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
-    trainer.save_freq=100 \
-    trainer.test_freq=100 \
+    trainer.save_freq=50 \
+    trainer.test_freq=50 \
     trainer.project_name=$WAND_PROJECT \
     trainer.experiment_name=$EXPERIMENT_NAME \
     trainer.total_epochs=15 \
     trainer.total_training_steps=1005 \
     trainer.default_hdfs_dir=null \
-    trainer.default_local_dir=/home/peterjin/verl_checkpoints/$EXPERIMENT_NAME \
+    trainer.default_local_dir=/home/pxw240002/Search-R1/verl_checkpoints/$EXPERIMENT_NAME \
     reward_model.structure_format_score=0.2 \
     reward_model.final_format_score=0.1 \
     reward_model.retrieval_score=0 \
     max_turns=4 \
     retriever.url="http://127.0.0.1:8000/retrieve" \
     retriever.topk=3 \
-    2>&1 | tee /home/peterjin/rl_logs/$EXPERIMENT_NAME.log
+    2>&1 | tee /home/pxw240002/Search-R1/rl_logs/$EXPERIMENT_NAME.log
