@@ -388,19 +388,20 @@ class LLMGenerationManager:
                     valid_action.append(1)
                     is_search.append(0)
                 elif action == 'search':
-                    next_obs.append(f'\n\n<information>{search_results.pop(0).strip()}</information>\n\n')
+                    next_obs.append(f'\n    <context>{search_results.pop(0).strip()}</context>\n    <conclusion>')
                     dones.append(0)
                     valid_action.append(1)
                     is_search.append(1)
                 else:
                     next_obs.append(f'\nMy previous action is invalid. \
 If I want to search, I should put the query between <search> and </search>. \
+If I want to use my own knowledge and previous search results, I should directly give the <conclusion>. \
 If I want to give the final answer, I should put the answer between <answer> and </answer>. Let me try again.\n')
                     dones.append(0)
                     valid_action.append(0)
                     is_search.append(0)
             
-        assert len(search_results) == 0
+        # assert len(search_results) == 0
             
         return next_obs, dones, valid_action, is_search
 
@@ -443,8 +444,14 @@ If I want to give the final answer, I should put the answer between <answer> and
         Returns:
             search results which is concatenated into a string
         """
+        # print("Search queries:", queries)  # Print the actual search queries
         results = self._batch_search(queries)['result']
-        
+
+        # for query, result in zip(queries, results):
+        #     print("Search query:", query)
+        #     print("Retrieval result:", self._passages2string(result))
+        #     print("="*40)
+
         return [self._passages2string(result) for result in results]
 
     def _batch_search(self, queries):
