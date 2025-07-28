@@ -161,37 +161,154 @@ def compute_score_em(solution_str, ground_truth, method='strict', structure_form
         format_score: the score for the format
         score: the score for the correct answer
     """
-    is_valid_format, _ = is_valid_sequence(solution_str)
-    retrieval_correct = False
-    if is_valid_format:
-        retrieval_correct = is_retrieval_correct(solution_str, ground_truth['target'])
+    # is_valid_format, _ = is_valid_sequence(solution_str)
+    # retrieval_correct = False
+    # if is_valid_format:
+    #     retrieval_correct = is_retrieval_correct(solution_str, ground_truth['target'])
     answer = extract_solution(solution_str=solution_str)
     do_print = random.randint(1, 64) == 1
+
+    final_reward = search_r1_format(solution_str, ground_truth['target'], lambda_f=structure_format_score)
     
     if do_print:
         print(f"--------------------------------")
         print(f"Golden answers: {ground_truth['target']}")
         print(f"Extracted answer: {answer}")
+        print(f"Final reward: {final_reward}")
         print(f"Solution string: {solution_str}")
             
-    if answer is None:
-        if is_valid_format:
-            if retrieval_correct:
-                return structure_format_score + retrieval_score # 0.3
-            else:
-                return structure_format_score # 0.2
+    # if answer is None:
+    #     if is_valid_format:
+    #         if retrieval_correct:
+    #             return structure_format_score + retrieval_score # 0.3
+    #         else:
+    #             return structure_format_score # 0.2
+    #     else:
+    #         return 0
+    # else:
+    #     if em_check(answer, ground_truth['target']):
+    #         if is_valid_format:
+    #             return score # 1
+    #         else:
+    #             return score - structure_format_score # 0.8
+    #     elif is_valid_format:
+    #         if retrieval_correct:
+    #             return structure_format_score + retrieval_score # 0.3
+    #         else:
+    #             return structure_format_score # 0.2
+    #     else:
+    #         return final_format_score # 0.1
+    return final_reward
+
+
+def normalize_string(str):
+    """Normalize answer by removing articles, punctuation, extra spaces, and lowercasing."""
+    # Remove articles, punctuation, lowercase, and fix whitespace in one pass
+    str = re.sub(r'\b(a|an|the)\b', ' ', str.lower())
+    str = ''.join(c if c not in string.punctuation else ' ' for c in str)
+    return ' '.join(str.split())
+
+
+def cover_exact_match(pred, gold):
+    """Check if any golden answer is a substring of the prediction."""
+    if isinstance(gold, str):
+        gold = [gold]
+    norm_pred = normalize_string(pred)
+    return any(normalize_string(ans) in norm_pred for ans in gold)
+
+
+def extract_str_between(text: str, str_before: str, str_after: str):
+    pattern = f"{re.escape(str_before)}(.*?){re.escape(str_after)}"
+    matches = re.findall(pattern, text, flags=re.DOTALL)
+    return matches
+
+
+def check_full_response_format(full_response: str) -> bool:
+    """
+    Check if the model response is in the correct format as specified in AGENT_PROMPT_V2 for agentic rag LLM.
+    Returns True if the format is correct, otherwise False.
+    Accepts two step formats:
+      1. <step><reasoning>...</reasoning><search>...</search><context>...</context><conclusion>...</conclusion></step>
+      2. <step><reasoning>...</reasoning><conclusion>...</conclusion></step>
+    """
+    # Find the last occurrence of <think>
+    idx = full_response.rfind('<think>')
+    if idx == -1:
+        return False
+    response = full_response[idx:].strip()
+    # Regex for the overall structure: <think>...</think><answer>...</answer>
+    pattern = re.compile(
+        r'^<think>\s*((<step>.*?</step>\s*)+)</think>\s*<answer>.*?</answer>\s*$',
+        re.DOTALL
+    )
+    match = pattern.match(response)
+    if not match:
+        return False
+    # Extract all <step> blocks
+    steps = re.findall(r'<step>(.*?)</step>', match.group(1), re.DOTALL)
+    if not steps:
+        return False
+    # Check each <step> for required tags in order, no duplicates, and valid format
+    for step in steps:
+        # Find all tags in order
+        tags = re.findall(r'<(reasoning|search|context|conclusion)>', step)
+        # Acceptable tag sequences:
+        # 1. ['reasoning', 'search', 'context', 'conclusion']
+        # 2. ['reasoning', 'conclusion']
+        if tags == ['reasoning', 'search', 'context', 'conclusion']:
+            # Ensure each tag appears only once
+            for tag in ['reasoning', 'search', 'context', 'conclusion']:
+                if step.count(f'<{tag}>') != 1 or step.count(f'</{tag}>') != 1:
+                    return False
+            # Ensure <search> and <context> are non-empty
+            for tag in ['search', 'context']:
+                content = re.search(f'<{tag}>(.*?)</{tag}>', step, re.DOTALL)
+                if content is None or content.group(1).strip() == '':
+                    return False
+            # Ensure no extra tags between <step> and </step> by removing the four required tags and their content
+            cleaned = step
+            for tag in ['reasoning', 'search', 'context', 'conclusion']:
+                cleaned = re.sub(f'<{tag}>.*?</{tag}>', '', cleaned, flags=re.DOTALL)
+            if re.search(r'</?[^>]+>', cleaned):
+                return False
+        elif tags == ['reasoning', 'conclusion']:
+            # Ensure each tag appears only once
+            for tag in ['reasoning', 'conclusion']:
+                if step.count(f'<{tag}>') != 1 or step.count(f'</{tag}>') != 1:
+                    return False
+            # Ensure no extra tags between <step> and </step> by removing the two required tags and their content
+            cleaned = step
+            for tag in ['reasoning', 'conclusion']:
+                cleaned = re.sub(f'<{tag}>.*?</{tag}>', '', cleaned, flags=re.DOTALL)
+            if re.search(r'</?[^>]+>', cleaned):
+                return False
         else:
-            return 0
+            return False
+    return True
+
+
+def search_r1_format(model_response, ground_truth_answer, lambda_f=0.4):
+    """
+    Implements the reward function of Search R1 from Equation 3 in Section 4.1 in the paper "An Empirical Study on Reinforcement Learning for Reasoning-Search Interleaved LLM Agents" (https://arxiv.org/abs/2505.15117).
+    
+    Args:
+        model_response: The complete model response string
+        ground_truth_answer: The correct answer (string or list of strings)
+        lambda_f: Format reward weight (default 0.4 for 7B models)
+    
+    Returns:
+        float: Reward score between 0 and 1
+    """
+    # Extract predicted answer
+    answer_matches = extract_str_between(model_response, '<answer>', '</answer>')
+    predicted_answer = answer_matches[-1].strip() if answer_matches else ""
+    
+    # Check correctness and format
+    answer_correct = cover_exact_match(predicted_answer, ground_truth_answer)
+    format_correct = check_full_response_format(model_response)
+    
+    # Apply Equation 3
+    if answer_correct:
+        return 1.0 if format_correct else 1.0 - lambda_f
     else:
-        if em_check(answer, ground_truth['target']):
-            if is_valid_format:
-                return score # 1
-            else:
-                return score - structure_format_score # 0.8
-        elif is_valid_format:
-            if retrieval_correct:
-                return structure_format_score + retrieval_score # 0.3
-            else:
-                return structure_format_score # 0.2
-        else:
-            return final_format_score # 0.1
+        return lambda_f if format_correct else 0.0
