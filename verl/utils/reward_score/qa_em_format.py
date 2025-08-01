@@ -168,10 +168,15 @@ def compute_score_em(solution_str, ground_truth, method='strict', structure_form
     answer = extract_solution(solution_str=solution_str)
     do_print = random.randint(1, 64) == 1
 
-    final_reward = search_r1_format(solution_str, ground_truth['target'], lambda_f=structure_format_score)
+    if structure_format_score == 0:
+        final_reward = 1 if cover_exact_match(answer, ground_truth['target']) else 0
+    else:
+        final_reward = search_r1_format(solution_str, ground_truth['target'], lambda_f=structure_format_score)
     
     if do_print:
         print(f"--------------------------------")
+        if structure_format_score == 0:
+            print("Test Sample")
         print(f"Golden answers: {ground_truth['target']}")
         print(f"Extracted answer: {answer}")
         print(f"Final reward: {final_reward}")
