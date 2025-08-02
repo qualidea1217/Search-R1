@@ -216,16 +216,29 @@ def normalize_string(str):
 
 def cover_exact_match(pred, gold):
     """Check if any golden answer is a substring of the prediction."""
+    if not pred:
+        return False
     if isinstance(gold, str):
         gold = [gold]
     norm_pred = normalize_string(pred)
     return any(normalize_string(ans) in norm_pred for ans in gold)
 
 
-def extract_str_between(text: str, str_before: str, str_after: str):
-    pattern = f"{re.escape(str_before)}(.*?){re.escape(str_after)}"
-    matches = re.findall(pattern, text, flags=re.DOTALL)
-    return matches
+def extract_str_between(text, start, end):
+    """Extract strings between start and end markers."""
+    results = []
+    start_idx = 0
+    while True:
+        start_idx = text.find(start, start_idx)
+        if start_idx == -1:
+            break
+        start_idx += len(start)
+        end_idx = text.find(end, start_idx)
+        if end_idx == -1:
+            break
+        results.append(text[start_idx:end_idx])
+        start_idx = end_idx + len(end)
+    return results
 
 
 def check_full_response_format(full_response: str) -> bool:
@@ -292,6 +305,251 @@ def check_full_response_format(full_response: str) -> bool:
     return True
 
 
+def check_full_response_format_optimized(full_response: str) -> bool:
+    """
+    Optimized version of check_full_response_format.
+    Check if the model response is in the correct format as specified in AGENT_PROMPT_V2 for agentic rag LLM.
+    Returns True if the format is correct, otherwise False.
+    Accepts two step formats:
+      1. <step><reasoning>...</reasoning><search>...</search><context>...</context><conclusion>...</conclusion></step>
+      2. <step><reasoning>...</reasoning><conclusion>...</conclusion></step>
+    """
+    # Find the last occurrence of <think>
+    idx = full_response.rfind('<think>')
+    if idx == -1:
+        return False
+    
+    # Extract the relevant part and strip whitespace
+    response = full_response[idx:].strip()
+    
+    # Quick checks for required structure using string methods instead of regex
+    if not response.startswith('<think>'):
+        return False
+    
+    # Find the end of think tag
+    think_end = response.find('</think>')
+    if think_end == -1:
+        return False
+    
+    # Check for answer tag after think - must handle whitespace
+    answer_section = response[think_end + 8:].lstrip()  # Skip '</think>' and whitespace
+    if not answer_section.startswith('<answer>'):
+        return False
+    
+    answer_end = answer_section.find('</answer>')
+    if answer_end == -1:
+        return False
+    
+    # Check no extra content after </answer>
+    remaining = answer_section[answer_end + 9:].strip()
+    if remaining:
+        return False
+    
+    # Extract think content (handle potential whitespace)
+    think_start = 7  # Length of '<think>'
+    # Skip whitespace after <think>
+    while think_start < think_end and response[think_start].isspace():
+        think_start += 1
+    
+    think_content = response[think_start:think_end].rstrip()
+    
+    # Check if there's at least one step
+    if '<step>' not in think_content or '</step>' not in think_content:
+        return False
+    
+    # Process each step
+    step_start = 0
+    while True:
+        # Find next step
+        step_tag_start = think_content.find('<step>', step_start)
+        if step_tag_start == -1:
+            break
+        
+        step_tag_end = think_content.find('</step>', step_tag_start)
+        if step_tag_end == -1:
+            return False
+        
+        # Extract step content
+        step_content = think_content[step_tag_start + 6:step_tag_end]
+        
+        # Check step format using a more efficient approach
+        if not validate_step_optimized(step_content):
+            return False
+        
+        step_start = step_tag_end + 7  # Move past '</step>'
+    
+    return True
+
+
+def validate_step_optimized(step_content: str) -> bool:
+    """
+    Optimized validation of a single step's content.
+    Returns True if the step follows one of the two valid formats.
+    """
+    # Quick check for reasoning tag (required in both formats)
+    reasoning_start = step_content.find('<reasoning>')
+    if reasoning_start == -1:
+        return False
+    
+    reasoning_end = step_content.find('</reasoning>', reasoning_start)
+    if reasoning_end == -1:
+        return False
+    
+    # Check what comes after reasoning
+    after_reasoning = step_content[reasoning_end + 12:]
+    
+    # Check for search tag (format 1)
+    if '<search>' in after_reasoning:
+        # Format 1: reasoning, search, context, conclusion
+        search_start = after_reasoning.find('<search>')
+        search_end = after_reasoning.find('</search>', search_start)
+        if search_end == -1:
+            return False
+        
+        # Check if search is non-empty
+        search_content = after_reasoning[search_start + 8:search_end].strip()
+        if not search_content:
+            return False
+        
+        # Check for context
+        after_search = after_reasoning[search_end + 9:]
+        context_start = after_search.find('<context>')
+        if context_start == -1:
+            return False
+        
+        context_end = after_search.find('</context>', context_start)
+        if context_end == -1:
+            return False
+        
+        # Check if context is non-empty
+        context_content = after_search[context_start + 9:context_end].strip()
+        if not context_content:
+            return False
+        
+        # Check for conclusion
+        after_context = after_search[context_end + 10:]
+        conclusion_start = after_context.find('<conclusion>')
+        if conclusion_start == -1:
+            return False
+        
+        conclusion_end = after_context.find('</conclusion>', conclusion_start)
+        if conclusion_end == -1:
+            return False
+        
+        # Verify tag counts using a more efficient method
+        tag_counts = count_tags_optimized(step_content)
+        if (tag_counts.get('reasoning', 0) != 1 or
+            tag_counts.get('search', 0) != 1 or
+            tag_counts.get('context', 0) != 1 or
+            tag_counts.get('conclusion', 0) != 1):
+            return False
+        
+        # Check for extra tags
+        if has_extra_tags_format1(step_content):
+            return False
+        
+    else:
+        # Format 2: reasoning, conclusion
+        conclusion_start = after_reasoning.find('<conclusion>')
+        if conclusion_start == -1:
+            return False
+        
+        conclusion_end = after_reasoning.find('</conclusion>', conclusion_start)
+        if conclusion_end == -1:
+            return False
+        
+        # Verify tag counts
+        tag_counts = count_tags_optimized(step_content)
+        if (tag_counts.get('reasoning', 0) != 1 or
+            tag_counts.get('conclusion', 0) != 1):
+            return False
+        
+        # Check for extra tags
+        if has_extra_tags_format2(step_content):
+            return False
+    
+    return True
+
+
+def count_tags_optimized(content: str) -> dict:
+    """
+    Efficiently count occurrences of specific tags.
+    """
+    tags = ['reasoning', 'search', 'context', 'conclusion']
+    counts = {}
+    
+    for tag in tags:
+        open_tag = f'<{tag}>'
+        close_tag = f'</{tag}>'
+        
+        # Count occurrences
+        open_count = content.count(open_tag)
+        close_count = content.count(close_tag)
+        
+        if open_count > 0 or close_count > 0:
+            counts[tag] = open_count
+    
+    return counts
+
+
+def has_extra_tags_format1(content: str) -> bool:
+    """
+    Check for extra tags in format 1 (with all 4 tags).
+    Optimized version using string operations instead of regex.
+    """
+    # Create a mutable copy of content
+    cleaned = content
+    
+    # Remove all valid tag pairs and their content
+    for tag in ['reasoning', 'search', 'context', 'conclusion']:
+        start_tag = f'<{tag}>'
+        end_tag = f'</{tag}>'
+        
+        while True:
+            start_idx = cleaned.find(start_tag)
+            if start_idx == -1:
+                break
+            
+            end_idx = cleaned.find(end_tag, start_idx)
+            if end_idx == -1:
+                break
+            
+            # Remove the tag and its content
+            cleaned = cleaned[:start_idx] + cleaned[end_idx + len(end_tag):]
+    
+    # Check if any tags remain by looking for < and > characters
+    return '<' in cleaned and '>' in cleaned
+
+
+def has_extra_tags_format2(content: str) -> bool:
+    """
+    Check for extra tags in format 2 (only reasoning and conclusion).
+    Optimized version using string operations instead of regex.
+    """
+    # Create a mutable copy of content
+    cleaned = content
+    
+    # Remove all valid tag pairs and their content
+    for tag in ['reasoning', 'conclusion']:
+        start_tag = f'<{tag}>'
+        end_tag = f'</{tag}>'
+        
+        while True:
+            start_idx = cleaned.find(start_tag)
+            if start_idx == -1:
+                break
+            
+            end_idx = cleaned.find(end_tag, start_idx)
+            if end_idx == -1:
+                break
+            
+            # Remove the tag and its content
+            cleaned = cleaned[:start_idx] + cleaned[end_idx + len(end_tag):]
+    
+    # Check if any tags remain by looking for < and > characters
+    return '<' in cleaned and '>' in cleaned
+
+
 def search_r1_format(model_response, ground_truth_answer, lambda_f=0.4):
     """
     Implements the reward function of Search R1 from Equation 3 in Section 4.1 in the paper "An Empirical Study on Reinforcement Learning for Reasoning-Search Interleaved LLM Agents" (https://arxiv.org/abs/2505.15117).
@@ -310,7 +568,7 @@ def search_r1_format(model_response, ground_truth_answer, lambda_f=0.4):
     
     # Check correctness and format
     answer_correct = cover_exact_match(predicted_answer, ground_truth_answer)
-    format_correct = check_full_response_format(model_response)
+    format_correct = check_full_response_format_optimized(model_response)
     
     # Apply Equation 3
     if answer_correct:
