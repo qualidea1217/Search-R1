@@ -185,6 +185,7 @@ def compute_score_em(solution_str, ground_truth, method='strict', structure_form
     except Exception as e:
         print(f"Error: {e}")
         final_reward = 0
+        print(f"Solution string: {solution_str}")
         print(f"Solution String failed to be processed, directly set final reward to {final_reward}")
             
     # if answer is None:
