@@ -165,22 +165,27 @@ def compute_score_em(solution_str, ground_truth, method='strict', structure_form
     # retrieval_correct = False
     # if is_valid_format:
     #     retrieval_correct = is_retrieval_correct(solution_str, ground_truth['target'])
-    answer = extract_solution(solution_str=solution_str)
-    do_print = random.randint(1, 64) == 1
+    try:
+        answer = extract_solution(solution_str=solution_str)
+        do_print = random.randint(1, 64) == 1
 
-    if structure_format_score == 0:
-        final_reward = 1 if cover_exact_match(answer, ground_truth['target']) else 0
-    else:
-        final_reward = search_r1_format(solution_str, ground_truth['target'], lambda_f=structure_format_score)
-    
-    if do_print:
-        print(f"--------------------------------")
         if structure_format_score == 0:
-            print("Test Sample")
-        print(f"Golden answers: {ground_truth['target']}")
-        print(f"Extracted answer: {answer}")
-        print(f"Final reward: {final_reward}")
-        print(f"Solution string: {solution_str}")
+            final_reward = 1 if cover_exact_match(answer, ground_truth['target']) else 0
+        else:
+            final_reward = search_r1_format(solution_str, ground_truth['target'], lambda_f=structure_format_score)
+        
+        if do_print:
+            print(f"--------------------------------")
+            if structure_format_score == 0:
+                print("Test Sample")
+            print(f"Golden answers: {ground_truth['target']}")
+            print(f"Extracted answer: {answer}")
+            print(f"Final reward: {final_reward}")
+            print(f"Solution string: {solution_str}")
+    except Exception as e:
+        print(f"Error: {e}")
+        final_reward = 0
+        print(f"Solution String failed to be processed, directly set final reward to {final_reward}")
             
     # if answer is None:
     #     if is_valid_format:
