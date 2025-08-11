@@ -15,6 +15,7 @@
 import re
 import string
 import random
+from vllm import SamplingParams
 
 def normalize_answer(s):
     def remove_articles(text):
@@ -151,7 +152,7 @@ def is_retrieval_correct(text: str, golden_answers: list[str]) -> list[str]:
     return False
 
 
-def compute_score_em(solution_str, ground_truth, method='strict', structure_format_score=0, final_format_score=0, retrieval_score=0, format_score=0, score=1.):
+def compute_score_em(solution_str, ground_truth, method='strict', structure_format_score=0, final_format_score=0, retrieval_score=0, format_score=0, score=1., actor_rollout_wg=None):
     """The scoring function for exact match (EM).
 
     Args:
@@ -168,6 +169,14 @@ def compute_score_em(solution_str, ground_truth, method='strict', structure_form
     try:
         answer = extract_solution(solution_str=solution_str)
         do_print = random.randint(1, 64) == 1
+
+        if actor_rollout_wg:
+            sampling_params = SamplingParams(max_tokens=512)
+            outputs = actor_rollout_wg.inference_engine.generate(["How are you?"])
+            for output in outputs:
+                prompt = output.prompt
+                generated_text = output.outputs[0].text
+                print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
 
         if structure_format_score == 0:
             final_reward = 1 if cover_exact_match(answer, ground_truth['target']) else 0
