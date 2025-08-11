@@ -83,7 +83,7 @@ class RewardManager():
                                      final_format_score=self.final_format_score, 
                                      retrieval_score=self.retrieval_score,
                                      format_score=self.format_score,
-                                     actor_rollout_wg=self.actor_rollout_wg)
+                                     actor_rollout_wg=actor_rollout_wg)
 
             reward_tensor[i, valid_response_length - 1] = score
             # all_scores.append(score)
