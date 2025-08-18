@@ -12,10 +12,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
+from openai import OpenAI, AsyncOpenAI
 import re
 import string
 import random
-from vllm import SamplingParams
+import torch
+import logging
+from typing import Union, List
+from verl import DataProto
+from tensordict import TensorDict
+from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto, DataProtoItem
+
+logger = logging.getLogger(__name__)
+
+client = OpenAI(api_key="")
+client_async = AsyncOpenAI(api_key="")
+
+SEARCH_STEP_VERIFY_PROMPT_V1 = "You are an expert in Natural Language Understanding and Semantic Analysis. Your goal is to determine if these two statements are semantically equivalent—that is, if they mean the same thing and convey the same core information. Provide your answers with a single boolean value \"True\" or \"False\" in the tag <answer></answer> (e.g. <answer>True</answer> or <answer>False</answer>)."
+
+NON_SEARCH_STEP_VERIFY_PROMPT_V1 = """You are an expert Fact-Checker and Logic Verifier. Your task is to evaluate a single, isolated reasoning step from an AI agent.
+
+This step was generated without using a search tool. Your goal is to determine if the agent made a mistake by not searching, based only on the information within this single step and your own general knowledge.
+
+Analyze the provided step by asking two questions:
+1. Factual Accuracy: Is the statement in the <reasoning></reasoning> and <conclusion></conclusion> factually correct?
+2. Internal Logic: Does the <conclusion></conclusion> logically follow from the <reasoning></reasoning> provided within this same step?
+
+If both questions are answered correctly, provide your answers with a single boolean value "True" or "False" in the tag <answer></answer> (e.g. <answer>True</answer> or <answer>False</answer>).
+"""
 
 def normalize_answer(s):
     def remove_articles(text):
@@ -152,7 +177,7 @@ def is_retrieval_correct(text: str, golden_answers: list[str]) -> list[str]:
     return False
 
 
-def compute_score_em(solution_str, ground_truth, method='strict', structure_format_score=0, final_format_score=0, retrieval_score=0, format_score=0, score=1., actor_rollout_wg=None):
+def compute_score_em(solution_str, ground_truth, method='strict', structure_format_score=0, final_format_score=0, retrieval_score=0, format_score=0, score=1., actor_rollout_wg=None, tokenizer=None, all_search_query_dict=None):
     """The scoring function for exact match (EM).
 
     Args:
@@ -166,36 +191,93 @@ def compute_score_em(solution_str, ground_truth, method='strict', structure_form
     # retrieval_correct = False
     # if is_valid_format:
     #     retrieval_correct = is_retrieval_correct(solution_str, ground_truth['target'])
-    try:
-        answer = extract_solution(solution_str=solution_str)
-        do_print = random.randint(1, 64) == 1
+    # try:
+    print(f"--------------------------------")
+    answer = extract_solution(solution_str=solution_str)
+    do_print = random.randint(1, 64) == 1
 
-        if actor_rollout_wg:
-            sampling_params = SamplingParams(max_tokens=512)
-            outputs = actor_rollout_wg.inference_engine.generate(["How are you?"])
-            for output in outputs:
-                prompt = output.prompt
-                generated_text = output.outputs[0].text
-                print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
+    if structure_format_score == 0:
+        final_reward = 1 if cover_exact_match(answer, ground_truth['target']) else 0
+    else:
+        final_reward = search_r1_format(solution_str, ground_truth['target'], lambda_f=structure_format_score)
 
+    # do over-search and under-search evaluation sync version
+    # if final_reward == 1:
+    #     correct_count = 0
+    #     step_content_list, _ = get_steps_from_full_response(solution_str)
+    #     for step_content in step_content_list:
+    #         if "<search>" in step_content:  # search step
+    #             is_oversearched = test_oversearch_direct(step_content, tokenizer, client, all_search_query_dict, actor_rollout_wg)
+    #             if not is_oversearched:
+    #                 correct_count += 1
+    #             print(f"Search step is {'over' if is_oversearched else 'not over'}-searched")
+    #         else:  # non-search step
+    #             is_undersearched = test_undersearch(step_content, client)
+    #             if not is_undersearched:
+    #                 correct_count += 1
+    #             print(f"Non-search step is {'under' if is_undersearched else 'not under'}-searched")
+    #     final_reward += 0.4 * correct_count / len(step_content_list)
+
+    # do over-search and under-search evaluation using async openai client
+    # --- ASYNC over/under-search evaluation ---
+
+    if final_reward == 1:
+        correct_count = 0
+        step_content_list, _ = get_steps_from_full_response(solution_str)
+
+        async def _evaluate_steps_async():
+            tasks = []
+            for step_content in step_content_list:
+                if "<search>" in step_content:
+                    tasks.append(
+                        test_oversearch_direct_async(
+                            step_content=step_content,
+                            tokenizer=tokenizer,
+                            client=client_async,
+                            all_search_query_dict=all_search_query_dict,
+                            actor_rollout_wg=actor_rollout_wg,
+                        )
+                    )
+                else:
+                    tasks.append(
+                        test_undersearch_async(
+                            step_content=step_content,
+                            gpt_client=client_async,
+                        )
+                    )
+            return await asyncio.gather(*tasks)
+
+        results = asyncio.run(_evaluate_steps_async())
+
+        for step_content, res in zip(step_content_list, results):
+            if "<search>" in step_content:
+                is_oversearched = res
+                if not is_oversearched:
+                    correct_count += 1
+                print(f"Search step is {'over' if is_oversearched else 'not over'}-searched")
+            else:
+                is_undersearched = res
+                if not is_undersearched:
+                    correct_count += 1
+                print(f"Non-search step is {'under' if is_undersearched else 'not under'}-searched")
+
+        if step_content_list:
+            final_reward += 0.4 * correct_count / len(step_content_list)
+    # --- END OF ASYNC over/under-search evaluation ---
+    
+    if do_print:
+        print(f"--------------------------------")
         if structure_format_score == 0:
-            final_reward = 1 if cover_exact_match(answer, ground_truth['target']) else 0
-        else:
-            final_reward = search_r1_format(solution_str, ground_truth['target'], lambda_f=structure_format_score)
-        
-        if do_print:
-            print(f"--------------------------------")
-            if structure_format_score == 0:
-                print("Test Sample")
-            print(f"Golden answers: {ground_truth['target']}")
-            print(f"Extracted answer: {answer}")
-            print(f"Final reward: {final_reward}")
-            print(f"Solution string: {solution_str}")
-    except Exception as e:
-        print(f"Error: {e}")
-        final_reward = 0
+            print("Test Sample")
+        print(f"Golden answers: {ground_truth['target']}")
+        print(f"Extracted answer: {answer}")
+        print(f"Final reward: {final_reward}")
         print(f"Solution string: {solution_str}")
-        print(f"Solution String failed to be processed, directly set final reward to {final_reward}")
+    # except Exception as e:
+    #     print(f"Error: {e}")
+    #     final_reward = 0
+    #     print(f"Solution string: {solution_str}")
+    #     print(f"Solution String failed to be processed, directly set final reward to {final_reward}")
             
     # if answer is None:
     #     if is_valid_format:
@@ -590,3 +672,388 @@ def search_r1_format(model_response, ground_truth_answer, lambda_f=0.4):
         return 1.0 if format_correct else 1.0 - lambda_f
     else:
         return lambda_f if format_correct else 0.0
+
+
+def get_steps_from_full_response(full_response: str) -> tuple[list[str], list[int]]:
+    """
+    Get the step content and start index of each step from the full response.
+    """
+    step_content_list, step_start_list = [], []
+    think_start = full_response.rfind("<think>")
+    think_end = full_response.find("</think>", think_start)
+    step_start = think_start
+    while step_start < think_end:
+        # Find next step
+        step_start = full_response.find('<step>', step_start)
+        if step_start == -1:
+            break
+        step_end = full_response.find('</step>', step_start)
+        if step_end == -1:
+            break
+        # Extract step content (excluding <step> and </step> tags)
+        step_content = full_response[step_start + 6:step_end]
+        step_content_list.append(step_content)
+        step_start_list.append(step_start)
+        step_start = step_end + 7  # Move past '</step>'
+    return step_content_list, step_start_list
+
+
+def test_oversearch_direct(step_content: str, tokenizer, client: OpenAI, all_search_query_dict: dict, actor_rollout_wg=None) -> bool:
+    """
+    Test the oversearch behavior of a single step by directly asking the search query to the model.
+    """
+    # Extract the search query and original conclusion of this step
+    search_query = extract_str_between(step_content, "<search>", "</search>")[-1]
+    conclusion_content = extract_str_between(step_content, "<conclusion>", "</conclusion>")[-1]
+
+    # Generate response by directly asking the search query to the model
+    try:
+        non_search_output = all_search_query_dict[search_query]
+    except KeyError:
+        if tokenizer.chat_template:
+            messages = [{"role": "user", "content": f"Please answer the following question or provide relevant information to the statement: {search_query}"}]
+            prompt = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+        else:
+            prompt = search_query
+
+        if actor_rollout_wg and tokenizer:
+            input_prompts, outputs = generate_extra_outputs_for_qa_em(
+                input_strings=[prompt],
+                actor_rollout_wg=actor_rollout_wg,
+                tokenizer=tokenizer,
+                temperature=1.0,
+                max_prompt_length=512
+            )
+            
+            # 打印结果
+            non_search_output = outputs[0]
+            print(f"Extra Generation:Prompt: {input_prompts[0]!r}, Generated text: {non_search_output!r}")
+        else:
+            non_search_output = ""
+
+    # Determine if the two conclusions are equivalent
+    try:
+        completion = client.chat.completions.create(
+            model="gpt-5-mini",
+            messages=[{"role": "user", "content": SEARCH_STEP_VERIFY_PROMPT_V1 + f"\n\nStatement 1: {conclusion_content}\n\nStatement 2: {non_search_output}"}]
+        )
+        result = completion.choices[0].message.content
+        is_correct = extract_str_between(result, "<answer>", "</answer>")[-1]
+        return True if "True" in is_correct else False
+    except Exception as e:
+        print(f"Error in test_oversearch_direct: {e}")
+        return False
+
+
+async def test_oversearch_direct_async(step_content: str, tokenizer, client: AsyncOpenAI, all_search_query_dict: dict, actor_rollout_wg=None) -> bool:
+    """
+    Test the oversearch behavior of a single step by directly asking the search query to the model.
+    """
+    # Extract the search query and original conclusion of this step
+    search_query = extract_str_between(step_content, "<search>", "</search>")[-1]
+    conclusion_content = extract_str_between(step_content, "<conclusion>", "</conclusion>")[-1]
+
+    # Generate response by directly asking the search query to the model
+    try:
+        non_search_output = all_search_query_dict[search_query]
+    except KeyError:
+        if tokenizer.chat_template:
+            messages = [{"role": "user", "content": f"Please answer the following question or provide relevant information to the statement: {search_query}"}]
+            prompt = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+        else:
+            prompt = search_query
+
+        if actor_rollout_wg and tokenizer:
+            input_prompts, outputs = generate_extra_outputs_for_qa_em(
+                input_strings=[prompt],
+                actor_rollout_wg=actor_rollout_wg,
+                tokenizer=tokenizer,
+                temperature=1.0,
+                max_prompt_length=512
+            )
+            
+            # 打印结果
+            non_search_output = outputs[0]
+            print(f"Extra Generation:Prompt: {input_prompts[0]!r}, Generated text: {non_search_output!r}")
+        else:
+            non_search_output = ""
+
+    # Determine if the two conclusions are equivalent
+    try:
+        completion = await client.chat.completions.create(
+            model="gpt-5-mini",
+            messages=[{"role": "user", "content": SEARCH_STEP_VERIFY_PROMPT_V1 + f"\n\nStatement 1: {conclusion_content}\n\nStatement 2: {non_search_output}"}]
+        )
+        result = completion.choices[0].message.content
+        is_correct = extract_str_between(result, "<answer>", "</answer>")[-1]
+        return True if "True" in is_correct else False
+    except Exception as e:
+        print(f"Error in test_oversearch_direct_async: {e}")
+        return False
+
+
+def test_undersearch(step_content: str, client: OpenAI) -> bool:
+    """
+    Test the undersearch behavior of a single step using openai client.
+    """
+    try:
+        completion = client.chat.completions.create(
+            model="gpt-5-mini",
+            messages=[{"role": "user", "content": NON_SEARCH_STEP_VERIFY_PROMPT_V1 + f"\n\nStep Content: {step_content}"}]
+        )
+        result = completion.choices[0].message.content
+        is_correct = extract_str_between(result, "<answer>", "</answer>")[-1]
+        return False if "True" in is_correct else True
+    except Exception as e:
+        print(f"Error in test_undersearch: {e}")
+        return False
+
+
+async def test_undersearch_async(step_content: str, gpt_client: AsyncOpenAI) -> bool:
+    """
+    Test the undersearch behavior of a single step using async openai client.
+    """
+    try:
+        completion = await gpt_client.chat.completions.create(
+            model="gpt-5-mini",
+            messages=[{"role": "user", "content": NON_SEARCH_STEP_VERIFY_PROMPT_V1 + f"\n\nStep Content: {step_content}"}]
+        )
+        result = completion.choices[0].message.content
+        is_correct = extract_str_between(result, "<answer>", "</answer>")[-1]
+        return False if "True" in is_correct else True
+    except Exception as e:
+        print(f"Error in test_undersearch_async: {e}")
+        return False
+
+
+def generate_extra_outputs_for_qa_em(
+    input_strings: Union[str, List[str]],
+    actor_rollout_wg,
+    tokenizer,
+    max_prompt_length: int = 512,
+    temperature: float = 0.7,
+    top_p: float = 0.9,
+    top_k: int = 50,
+    batch_size: int = 128,
+    **kwargs
+) -> Union[str, List[str]]:
+    """
+    专门为qa_em_format设计的生成函数
+    可以直接在compute_score_em中使用
+    
+    Args:
+        input_strings: 输入字符串或字符串列表
+        actor_rollout_wg: RayWorkerGroup实例
+        tokenizer: 分词器
+        max_prompt_length: 最大提示长度
+        temperature: 采样温度
+        top_p: nucleus采样参数
+        top_k: top-k采样参数
+        batch_size: 批处理大小
+        **kwargs: 其他参数
+    
+    Returns:
+        生成的输出字符串或字符串列表
+    """
+    
+    # 输入预处理
+    if isinstance(input_strings, str):
+        input_list = [input_strings]
+        return_single = True
+    else:
+        input_list = input_strings
+        return_single = False
+    
+    if not input_list:
+        return "" if return_single else []
+    
+    # try:
+        # 分批处理
+    all_inputs = []
+    all_outputs = []
+    
+    for i in range(0, len(input_list), batch_size):
+        batch_inputs = input_list[i:i + batch_size]
+        
+        # 构建生成batch
+        gen_batch = _prepare_qa_generation_batch(
+            batch_inputs, tokenizer, max_prompt_length
+        )
+        
+        # 设置采样参数
+        sampling_kwargs = {
+            'temperature': temperature,
+            'top_p': top_p,
+            'top_k': top_k,
+            **kwargs
+        }
+        
+        # 调用生成方法（对齐到 world_size 的等分）
+        if hasattr(actor_rollout_wg, 'world_size'):
+            gen_batch_padded, pad_size = pad_dataproto_to_divisor(gen_batch, actor_rollout_wg.world_size)
+        else:
+            gen_batch_padded, pad_size = gen_batch, 0
+
+        gen_output_padded = actor_rollout_wg.generate_sequences(gen_batch_padded)
+        gen_output = unpad_dataproto(gen_output_padded, pad_size=pad_size) if pad_size else gen_output_padded
+        
+        # 解码输入与输出
+        batch_inputs, batch_outputs = _decode_qa_generation_output(gen_output, tokenizer)
+        all_inputs.extend(batch_inputs)
+        all_outputs.extend(batch_outputs)
+    
+    # 返回结果
+    # 始终返回两个列表，索引一一对应
+    return all_inputs, all_outputs
+        
+    # except Exception as e:
+    #     logger.error(f"QA generation failed: {e}")
+    #     # 返回空结果而不是抛出异常
+    #     return "" if return_single else [""] * len(input_list)
+
+
+def _prepare_qa_generation_batch(
+    prompts_text: List[str], 
+    tokenizer, 
+    max_prompt_length: int
+) -> DataProto:
+    """准备QA生成batch"""
+    
+    # temporarily change the padding side to left
+    original_padding_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"
+
+    batch_size = len(prompts_text)
+    
+    # 分词和编码
+    encoded = tokenizer(
+        prompts_text,
+        add_special_tokens=False,
+        # padding=True,
+        # truncation=True,
+        # max_length=max_prompt_length,
+        padding="longest",
+        return_tensors="pt"
+    )
+    
+    input_ids = encoded['input_ids']
+    attention_mask = encoded['attention_mask']
+    
+    # 构建position_ids
+    position_ids = torch.zeros_like(input_ids)
+    for i in range(batch_size):
+        non_pad_indices = (attention_mask[i] == 1).nonzero(as_tuple=True)[0]
+        if len(non_pad_indices) > 0:
+            first_token_pos = non_pad_indices[0]
+            seq_len = attention_mask[i].sum()
+            position_ids[i, first_token_pos:first_token_pos + seq_len] = torch.arange(seq_len)
+    
+    # 构建TensorDict
+    batch = TensorDict({
+        'input_ids': input_ids,
+        'attention_mask': attention_mask,
+        'position_ids': position_ids
+    }, batch_size=batch_size)
+    
+    # 设置元信息
+    meta_info = {
+        'eos_token_id': tokenizer.eos_token_id,
+        'pad_token_id': tokenizer.pad_token_id,
+        'do_sample': True,
+        'recompute_log_prob': False,
+    }
+
+    # restore the padding side
+    tokenizer.padding_side = original_padding_side
+    
+    return DataProto(batch=batch, meta_info=meta_info)
+
+
+def _decode_qa_generation_output(gen_output: DataProto, tokenizer) -> List[str]:
+    """解码QA生成的输入与输出"""
+    inputs, outputs = [], []
+
+    if isinstance(gen_output, DataProtoItem):
+        # The item itself contains a batch of data. We need to iterate over it.
+        batch_td = gen_output.batch
+        batch_size = batch_td.batch_size[0] # Get the batch size from the TensorDict
+
+        for i in range(batch_size):
+            # Slice the batch TensorDict to get the data for just the i-th item.
+            item_td = batch_td[i]
+
+            # Now, all tensors are 1D, and the logic will work correctly.
+            prompt_ids = item_td['prompts'] 
+            prompt_length = prompt_ids.shape[-1]
+            attention_mask = item_td['attention_mask'] 
+
+            valid_prompt_length = attention_mask[:prompt_length].sum()
+            valid_prompt_ids = prompt_ids[-valid_prompt_length:]
+
+            response_ids = item_td['responses'] 
+            valid_response_length = attention_mask[prompt_length:].sum()
+            valid_response_ids = response_ids[:valid_response_length]
+
+            # Concatenation now works because it's joining two 1D tensors.
+            print(f"valid_prompt_ids: {valid_prompt_ids.shape}, valid_response_ids: {valid_response_ids.shape}")
+            sequences = torch.cat((valid_prompt_ids, valid_response_ids))
+
+            sequences_str = tokenizer.decode(sequences)
+            print(f"Got DataProtoItem, sequences_str: {sequences_str}")
+            print(f"input str: {tokenizer.decode(valid_prompt_ids, skip_special_tokens=False)}")
+            print(f"output str: {tokenizer.decode(valid_response_ids, skip_special_tokens=False)}")
+            
+            # Append the decoded strings to your lists
+            inputs.append(tokenizer.decode(valid_prompt_ids, skip_special_tokens=False))
+            outputs.append(tokenizer.decode(valid_response_ids, skip_special_tokens=False))
+        # data_item = gen_output  # DataProtoItem
+
+        # prompt_ids = data_item.batch['prompts']
+
+        # prompt_length = prompt_ids.shape[-1]
+
+        # valid_prompt_length = data_item.batch['attention_mask'][:prompt_length].sum()
+        # valid_prompt_ids = prompt_ids[-valid_prompt_length:]
+
+        # response_ids = data_item.batch['responses']
+        # valid_response_length = data_item.batch['attention_mask'][prompt_length:].sum()
+        # valid_response_ids = response_ids[:valid_response_length]
+
+        # # decode
+        # print(f"valid_prompt_ids: {valid_prompt_ids.shape}, valid_response_ids: {valid_response_ids.shape}")
+        # sequences = torch.cat((valid_prompt_ids, valid_response_ids), dim=0)
+        # sequences_str = tokenizer.decode(sequences)
+        # print(f"Got DataProtoItem, sequences_str: {sequences_str}")
+        # print(f"input str: {tokenizer.decode(valid_prompt_ids, skip_special_tokens=False)}")
+        # print(f"output str: {tokenizer.decode(valid_response_ids, skip_special_tokens=False)}")
+        # inputs.append(tokenizer.decode(valid_prompt_ids, skip_special_tokens=False))
+        # outputs.append(tokenizer.decode(valid_response_ids, skip_special_tokens=False))
+
+    else:
+        batch_size = len(gen_output)
+        
+        for i in range(batch_size):
+            # 获取输入与响应部分
+            data_item = gen_output[i]  # DataProtoItem
+
+            prompt_ids = data_item.batch['prompts']
+
+            prompt_length = prompt_ids.shape[-1]
+
+            valid_prompt_length = data_item.batch['attention_mask'][:prompt_length].sum()
+            valid_prompt_ids = prompt_ids[-valid_prompt_length:]
+
+            response_ids = data_item.batch['responses']
+            valid_response_length = data_item.batch['attention_mask'][prompt_length:].sum()
+            valid_response_ids = response_ids[:valid_response_length]
+
+            # decode
+            sequences = torch.cat((valid_prompt_ids, valid_response_ids))
+            sequences_str = tokenizer.decode(sequences)
+            print(f"Got DataProto, sequences_str: {sequences_str}")
+            print(f"input str: {tokenizer.decode(valid_prompt_ids, skip_special_tokens=False)}")
+            print(f"output str: {tokenizer.decode(valid_response_ids, skip_special_tokens=False)}")
+            inputs.append(tokenizer.decode(valid_prompt_ids, skip_special_tokens=False))
+            outputs.append(tokenizer.decode(valid_response_ids, skip_special_tokens=False))
+    
+    return inputs, outputs
