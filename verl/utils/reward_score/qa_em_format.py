@@ -734,7 +734,7 @@ def test_oversearch_direct(step_content: str, tokenizer, client: OpenAI, all_sea
     # Determine if the two conclusions are equivalent
     try:
         completion = client.chat.completions.create(
-            model="gpt-5-mini",
+            model="gpt-5-nano",
             messages=[{"role": "user", "content": SEARCH_STEP_VERIFY_PROMPT_V1 + f"\n\nStatement 1: {conclusion_content}\n\nStatement 2: {non_search_output}"}]
         )
         result = completion.choices[0].message.content
@@ -781,7 +781,7 @@ async def test_oversearch_direct_async(step_content: str, tokenizer, client: Asy
     # Determine if the two conclusions are equivalent
     try:
         completion = await client.chat.completions.create(
-            model="gpt-5-mini",
+            model="gpt-5-nano",
             messages=[{"role": "user", "content": SEARCH_STEP_VERIFY_PROMPT_V1 + f"\n\nStatement 1: {conclusion_content}\n\nStatement 2: {non_search_output}"}]
         )
         result = completion.choices[0].message.content
@@ -798,7 +798,7 @@ def test_undersearch(step_content: str, client: OpenAI) -> bool:
     """
     try:
         completion = client.chat.completions.create(
-            model="gpt-5-mini",
+            model="gpt-5-nano",
             messages=[{"role": "user", "content": NON_SEARCH_STEP_VERIFY_PROMPT_V1 + f"\n\nStep Content: {step_content}"}]
         )
         result = completion.choices[0].message.content
@@ -815,7 +815,7 @@ async def test_undersearch_async(step_content: str, gpt_client: AsyncOpenAI) -> 
     """
     try:
         completion = await gpt_client.chat.completions.create(
-            model="gpt-5-mini",
+            model="gpt-5-nano",
             messages=[{"role": "user", "content": NON_SEARCH_STEP_VERIFY_PROMPT_V1 + f"\n\nStep Content: {step_content}"}]
         )
         result = completion.choices[0].message.content
