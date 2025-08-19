@@ -23,7 +23,7 @@ from tensordict import TensorDict
 
 logger = logging.getLogger(__name__)
 from verl import DataProto
-from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto, DataProtoItem
+from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto, DataProtoItem, collate_fn
 import torch
 from verl.utils.reward_score import qa_em, qa_em_format
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
@@ -88,7 +88,7 @@ def generate_extra_outputs_for_qa_em(
         
         # 构建生成batch
         gen_batch = _prepare_qa_generation_batch(
-            batch_inputs, tokenizer, max_prompt_length
+            batch_inputs, tokenizer, actor_rollout_wg.world_size, max_prompt_length
         )
         
         # 设置采样参数
@@ -105,8 +105,10 @@ def generate_extra_outputs_for_qa_em(
         else:
             gen_batch_padded, pad_size = gen_batch, 0
 
+        gen_batch_padded, pad_size = ensure_batch_is_padded(gen_batch_padded, gen_batch, actor_rollout_wg.world_size, pad_size)
         gen_output_padded = actor_rollout_wg.generate_sequences(gen_batch_padded)
         gen_output = unpad_dataproto(gen_output_padded, pad_size=pad_size) if pad_size else gen_output_padded
+        # gen_output = _generate_with_gpu_padding(actor_rollout_wg, gen_batch)
         
         # 解码输入与输出
         batch_inputs, batch_outputs = _decode_qa_generation_output(gen_output, tokenizer)
@@ -126,7 +128,8 @@ def generate_extra_outputs_for_qa_em(
 def _prepare_qa_generation_batch(
     prompts_text: List[str], 
     tokenizer, 
-    max_prompt_length: int
+    size_divisor: int = None,
+    max_prompt_length: int = None
 ) -> DataProto:
     """准备QA生成batch"""
     
@@ -135,6 +138,12 @@ def _prepare_qa_generation_batch(
     tokenizer.padding_side = "left"
 
     batch_size = len(prompts_text)
+
+    # pad the batch to the size_divisor
+    if size_divisor and batch_size % size_divisor != 0:
+        need_to_pad = size_divisor - batch_size % size_divisor
+        prompts_text = prompts_text + [prompts_text[0]] * need_to_pad
+        batch_size = len(prompts_text)
     
     # 分词和编码
     encoded = tokenizer(
@@ -268,6 +277,94 @@ def _decode_qa_generation_output(gen_output: DataProto, tokenizer) -> List[str]:
             outputs.append(tokenizer.decode(valid_response_ids, skip_special_tokens=False))
     
     return inputs, outputs
+
+
+def ensure_batch_is_padded(padded_batch, original_batch, divisor, original_pad_size):
+    """
+    Checks if a batch is correctly padded. If not, it applies a robust
+    padding fix and returns the corrected batch and the new pad_size.
+    """
+    # Check if the batch size is divisible by the number of workers.
+    if len(padded_batch) % divisor != 0:
+        print(
+            f"⚠️ Original padding failed! (Size: {len(padded_batch)}, Divisor: {divisor}). "
+            f"Applying a robust fix..."
+        )
+        original_size = len(original_batch)
+        if original_size == 0:
+            return original_batch, 0 # Return empty batch if original was empty
+
+        # --- Apply the robust padding logic ---
+        # Calculate the correct number of items to add.
+        new_pad_size = divisor - (original_size % divisor)
+        
+        # Create the padding data by repeating items from the original batch.
+        padding_items = [original_batch[i % original_size] for i in range(new_pad_size)]
+        padding_data = collate_fn(padding_items)
+        
+        # Concatenate the original batch with the new padding data.
+        fixed_padded_batch = DataProto.concat([original_batch, padding_data])
+        
+        print(f"✅ Fix applied. Batch resized from {original_size} to {len(fixed_padded_batch)}.")
+        
+        # Return the fixed batch and the correct new pad_size.
+        return fixed_padded_batch, new_pad_size
+    
+    # If the original padding was successful, just return the original values.
+    return padded_batch, original_pad_size
+
+
+def _generate_with_gpu_padding(actor_rollout_wg, active_batch: DataProto) -> DataProto:
+    """
+        Wrapper for generation that handles multi-GPU padding requirements.
+        if num_gpus <= 1, return self.actor_rollout_wg.generate_sequences(active_batch)
+        if active_batch size is not divisible by num_gpus, pad with first sequence
+        then remove padding from output
+    """
+    print(f"world_size: {actor_rollout_wg.world_size}")
+    num_gpus = actor_rollout_wg.world_size
+    if num_gpus <= 1:
+        return actor_rollout_wg.generate_sequences(active_batch)
+        
+    batch_size = active_batch.batch['input_ids'].shape[0]
+    remainder = batch_size % num_gpus
+    
+    for key in active_batch.batch.keys():
+        active_batch.batch[key] = active_batch.batch[key].long()
+    if remainder == 0:
+        return actor_rollout_wg.generate_sequences(active_batch)
+    
+    # Add padding sequences
+    padding_size = num_gpus - remainder
+    padded_batch = {}
+    
+    for k, v in active_batch.batch.items():
+        # Use first sequence as padding template
+        pad_sequence = v[0:1].repeat(padding_size, *[1] * (len(v.shape) - 1))
+        padded_batch[k] = torch.cat([v, pad_sequence], dim=0)
+
+    padded_active_batch = DataProto.from_dict(padded_batch)
+    for key in padded_active_batch.batch.keys():
+        padded_active_batch.batch[key] = padded_active_batch.batch[key].long()
+
+    # Generate with padded batch
+    padded_output = actor_rollout_wg.generate_sequences(padded_active_batch)
+
+    # Remove padding from output
+    trimmed_batch = {k: v[:-padding_size] for k, v in padded_output.batch.items()}
+    
+    # Handle meta_info if present
+    if hasattr(padded_output, 'meta_info') and padded_output.meta_info:
+        trimmed_meta = {}
+        for k, v in padded_output.meta_info.items():
+            if isinstance(v, torch.Tensor):
+                trimmed_meta[k] = v[:-padding_size]
+            else:
+                trimmed_meta[k] = v
+        padded_output.meta_info = trimmed_meta
+        
+    padded_output.batch = trimmed_batch
+    return padded_output
 
 
 class RewardManager():
